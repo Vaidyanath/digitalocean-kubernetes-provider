@@ -1,0 +1,161 @@
+#cloud-config
+
+write_files:
+  # - path: /opt/bin/haproxy_kubernetes.sh
+  #   permissions: 0755
+  #   content: |
+  #     #!/bin/bash
+  #     if [ ! -d /opt/kubernetes_haproxy ]; then
+  #       git clone https://github.com/jmarhee/kubernetes_haproxy /opt/kubernetes_haproxy
+  #     fi
+  #     cd /opt/kubernetes_haproxy && \
+  #     sh scripts/gen_ca.sh && \
+  #     sh scripts/gen_certs.sh && \
+  #     docker build -t kubernetes_haproxy:latest /opt/kubernetes_haproxy
+  - path: /opt/bin/download-release.sh
+    permissions: 0755
+    content: |
+      #!/bin/bash
+      # urldecode() {
+      #     # urldecode <string>
+      #
+      #     local url_encoded="${1//+/ }"
+      #     printf '%b' "${url_encoded//%/\\x}"
+      # }
+      # RELEASE="REL_URL"
+      ARCHIVE="https://storage.googleapis.com/kubernetes-release/release/vKUBE_VERSION/kubernetes-server-linux-amd64.tar.gz"
+      if [ ! -s /opt/kubernetes.tar.gz ]
+      then
+        echo "Downloading release ($ARCHIVE)"
+        wget "$ARCHIVE" -O kubernetes.tar.gz && mv kubernetes.tar.gz /opt/kubernetes.tar.gz
+        echo "Unpacking release"
+        rm -rf /opt/kubernetes || false
+        tar xzf /opt/kubernetes.tar.gz -C /opt/
+      else
+        echo "kubernetes release found. Skipping download."
+      fi
+
+
+coreos:
+  etcd2:
+    discovery: https://discovery.etcd.io/DISCOVERY_ID
+    advertise-client-urls: http://$private_ipv4:2379,http://$private_ipv4:4001
+    initial-advertise-peer-urls: http://$private_ipv4:2380
+    listen-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
+    listen-peer-urls: http://$private_ipv4:2380
+  fleet:
+    public-ip: $private_ipv4
+    metadata: kubernetes_role=master
+
+  update:
+    reboot-strategy: etcd-lock
+
+  units:
+    - name: etcd2.service
+      command: start
+    - name: fleet.service
+      command: start
+    - name: download-release.service
+      command: start
+      content: |
+        [Unit]
+        Description=Downloads Kubernetes Release
+        After=network-online.target
+        Requires=network-online.target
+        [Service]
+        Type=oneshot
+        RemainAfterExit=yes
+        ExecStart=/usr/bin/bash /opt/bin/download-release.sh
+    - name: kube-apiserver.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kubernetes API Server
+        Documentation=https://github.com/kubernetes/kubernetes
+        After=network-online.target
+        Requires=network-online.target
+        After=download-release.service
+        Requires=download-release.service
+        [Service]
+        ExecStartPre=/usr/bin/ln -sf /opt/kubernetes/server/bin/kube-apiserver /opt/bin/kube-apiserver
+        ExecStartPre=/usr/bin/mkdir -p /var/lib/kube-apiserver
+        ExecStart=/opt/bin/kube-apiserver \
+        --bind-address=$public_ipv4 \
+        --insecure-bind-address=127.0.0.1 \
+        --tls-cert-file=/opt/certs/apiserver.pem \
+        --tls-private-key-file=/opt/certs/apiserver-key.pem \
+        --client-ca-file=/opt/certs/ca.pem \
+        --service-account-key-file=/opt/certs/apiserver-key.pem \
+        --etcd-servers=http://127.0.0.1:4001 \
+        --logtostderr=true \
+        --secure-port=443 \
+        --insecure-port=8080 \
+        --service-cluster-ip-range=SERVICE_CLUSTER_IP_RANGE \
+        --token-auth-file=/var/lib/kube-apiserver/known_tokens.csv \
+        --v=2
+        Restart=always
+        RestartSec=5
+    - name: apiserver-advertiser.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kubernetes Apiserver Advertiser
+        After=etcd2.service
+        Requires=etcd2.service
+        After=master-apiserver.service
+        [Service]
+        ExecStart=/bin/sh -c 'etcdctl set /corekube/apiservers/$public_ipv4 $public_ipv4'
+        Restart=always
+        RestartSec=120
+    - name: kube-controller-manager.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kubernetes Controller Manager
+        After=etcd2.service
+        After=docker.service
+        After=apiserver.service
+        Wants=etcd2.service
+        Wants=docker.service
+        Wants=apiserver.service
+        [Service]
+        ExecStartPre=/usr/bin/ln -sf /opt/kubernetes/server/bin/kube-controller-manager /opt/bin/kube-controller-manager
+        ExecStart=/opt/bin/kube-controller-manager \
+        --logtostderr=true \
+        --master=127.0.0.1:8080 \
+        --v=2
+        Restart=always
+        RestartSec=5
+    - name: kube-scheduler.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kubernetes Scheduler
+        Documentation=https://github.com/kubernetes/kubernetes
+        After=network-online.target
+        Requires=network-online.target
+        After=kube-apiserver.service
+        Requires=kube-apiserver.service
+        [Service]
+        ExecStartPre=/usr/bin/ln -sf /opt/kubernetes/server/bin/kube-scheduler /opt/bin/kube-scheduler
+        ExecStart=/opt/bin/kube-scheduler \
+        --logtostderr=true \
+        --master=127.0.0.1:8080
+        Restart=always
+        RestartSec=5
+    # - name: kubernetes-haproxy.service
+    #   command: start
+    #   content: |
+    #     [Unit]
+    #     Description=Kubernetes HAProxy Service
+    #     After=network-online.target
+    #     Requires=network-online.target
+    #     After=docker.service
+    #     Requires=docker.service
+    #     [Service]
+    #     ExecStartPre=/opt/bin/haproxy_kubernetes.sh
+    #     ExecStartPre=-/usr/bin/docker rm -f kubernetes_nginx
+    #     ExecStart=/usr/bin/docker run -d --net=host -p $public_ipv4:443:443 --name kubernetes_haproxy kubernetes_haproxy
+    #     ExecStop=/usr/bin/docker stop kubernetes_nginx
+    #     Restart=always
+    #     RestartSec=15
